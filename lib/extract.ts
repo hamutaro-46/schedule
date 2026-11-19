@@ -1,16 +1,8 @@
-// ============================================================
-// AI で予定を読み取る（このアプリの心臓部）
-// Claude API に「画像 + テキスト」を送り、
-// structured outputs（output_config.format）で
-// 決まった形の JSON だけを返してもらう。
-// ============================================================
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenAI } from "@google/genai";
 import type { EventDraft, ExtractResponse } from "./types";
 
-// ANTHROPIC_API_KEY は環境変数から自動で読まれる
-const client = new Anthropic();
-
-const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-5-5";
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const MODEL = process.env.GEMINI_MODEL ?? "gemini-flash-latest";
 const TIME_ZONE = process.env.APP_TIME_ZONE ?? "Asia/Tokyo";
 
 export type ImageInput = {
@@ -18,23 +10,14 @@ export type ImageInput = {
   base64: string;
 };
 
-// AI に返してほしい JSON の形（JSON Schema）
-// 省略可能な項目も「空文字で返す」ルールにして、すべて required にしておくと扱いやすい
 const SCHEMA = {
   type: "object",
-  additionalProperties: false,
-  required: ["reply", "events"],
   properties: {
-    reply: {
-      type: "string",
-      description: "ユーザーへの短い返事（日本語）",
-    },
+    reply: { type: "string", description: "ユーザーへの短い返事（日本語）" },
     events: {
       type: "array",
       items: {
         type: "object",
-        additionalProperties: false,
-        required: ["title", "date", "endDate", "startTime", "endTime", "allDay", "location", "notes"],
         properties: {
           title: { type: "string" },
           date: { type: "string", description: "開始日 YYYY-MM-DD" },
@@ -45,20 +28,17 @@ const SCHEMA = {
           location: { type: "string", description: "場所。不明なら空文字" },
           notes: { type: "string", description: "補足メモ。無ければ空文字" },
         },
+        required: ["title", "date", "endDate", "startTime", "endTime", "allDay", "location", "notes"],
       },
     },
   },
-} as const;
+  required: ["reply", "events"],
+};
 
-/** 「今日」を AI に伝えるための文字列（"明日" "来週火曜" を正しく日付にするため） */
 function nowInfo() {
   const now = new Date();
-  const ymd = new Intl.DateTimeFormat("en-CA", { timeZone: TIME_ZONE }).format(now); // 2026-11-17
-  const human = new Intl.DateTimeFormat("ja-JP", {
-    timeZone: TIME_ZONE,
-    dateStyle: "full",
-    timeStyle: "short",
-  }).format(now); // 2026年11月17日火曜日 9:13
+  const ymd = new Intl.DateTimeFormat("en-CA", { timeZone: TIME_ZONE }).format(now);
+  const human = new Intl.DateTimeFormat("ja-JP", { timeZone: TIME_ZONE, dateStyle: "full", timeStyle: "short" }).format(now);
   return { ymd, human };
 }
 
@@ -81,55 +61,31 @@ function buildSystemPrompt(): string {
 - reply には、何件の予定を見つけたかなどを1〜2文の日本語で書く。`;
 }
 
-export async function extractEvents(input: {
-  text: string;
-  image?: ImageInput;
-}): Promise<ExtractResponse> {
-  const content: Anthropic.ContentBlockParam[] = [];
-
-  // 画像は文章より先に置くと読み取り精度が上がりやすい
+export async function extractEvents(input: { text: string; image?: ImageInput }): Promise<ExtractResponse> {
+  // Gemini では画像やテキストを "parts" の配列として送る
+  const parts: ({ inlineData: { mimeType: string; data: string } } | { text: string })[] = [];
   if (input.image) {
-    content.push({
-      type: "image",
-      source: { type: "base64", media_type: input.image.mediaType, data: input.image.base64 },
-    });
+    parts.push({ inlineData: { mimeType: input.image.mediaType, data: input.image.base64 } });
   }
-  content.push({
-    type: "text",
-    text: input.text.trim() || "この画像から予定を読み取って登録してください。",
-  });
+  parts.push({ text: input.text.trim() || "この画像から予定を読み取って登録してください。" });
 
-  const res = await client.messages.create({
+  const res = await ai.models.generateContent({
     model: MODEL,
-    max_tokens: 4096,
-    system: buildSystemPrompt(),
-    messages: [{ role: "user", content }],
-    output_config: {
-      format: { type: "json_schema", schema: SCHEMA },
+    contents: [{ role: "user", parts }],
+    config: {
+      systemInstruction: buildSystemPrompt(),
+      responseMimeType: "application/json",
+      responseJsonSchema: SCHEMA,
     },
   });
 
-  if (res.stop_reason === "refusal") {
-    return { reply: "この内容は処理できませんでした。", events: [] };
-  }
-  if (res.stop_reason === "max_tokens") {
-    throw new Error("応答が長すぎて途中で切れました。画像を分けて送ってください。");
-  }
+  const text = res.text;
+  if (!text) throw new Error("AI から予定データを受け取れませんでした。");
 
-  // 思考ブロックなどが混ざることがあるので、text ブロックを探して取り出す
-  const block = res.content.find((b) => b.type === "text");
-  if (!block || block.type !== "text") {
-    throw new Error("AI から予定データを受け取れませんでした。");
-  }
-
-  const parsed = JSON.parse(block.text) as ExtractResponse;
-  return {
-    reply: parsed.reply,
-    events: parsed.events.filter(isValidDraft),
-  };
+  const parsed = JSON.parse(text) as ExtractResponse;
+  return { reply: parsed.reply ?? "", events: (parsed.events ?? []).filter(isValidDraft) };
 }
 
-// 念のためサーバー側でも形式をチェックしておく
 function isValidDraft(d: EventDraft): boolean {
   const dateOk = /^\d{4}-\d{2}-\d{2}$/.test(d.date);
   const endDateOk = d.endDate === "" || /^\d{4}-\d{2}-\d{2}$/.test(d.endDate);
